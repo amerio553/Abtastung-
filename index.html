@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Sampling Lab</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    body { margin: 0; background:#0b0c10; color:#e7e7ea; }
+    .wrap { max-width: 1000px; margin: 0 auto; padding: 18px; }
+    h1 { margin: 0 0 8px; font-size: 22px; }
+    .card { background:#14151a; border:1px solid #242633; border-radius: 14px; padding: 14px; box-shadow: 0 8px 24px rgba(0,0,0,.25); }
+    .grid { display: grid; gap: 12px; grid-template-columns: 1fr; }
+    @media (min-width: 900px){ .grid { grid-template-columns: 360px 1fr; } }
+    label { display:block; font-size: 13px; opacity: .9; margin-top: 10px; }
+    input[type="range"] { width: 100%; }
+    .row { display:flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 10px;}
+    .pill { display:inline-flex; gap:8px; align-items:center; background:#0f1015; border:1px solid #242633; border-radius: 999px; padding: 8px 10px; font-size: 13px; }
+    .warn { border-color:#6b3a2d; background:#1a1210; color:#ffd3c9; }
+    canvas { width: 100%; height: 520px; display:block; background:#0f1015; border:1px solid #242633; border-radius: 14px; }
+    button {
+      background:#1e2240; color:#e7e7ea; border:1px solid #2b3268;
+      border-radius: 10px; padding: 10px 12px; cursor:pointer; font-weight: 600;
+    }
+    button:hover { filter: brightness(1.1); }
+    .tiny { font-size: 12px; opacity: .8; line-height: 1.35; }
+    select {
+      width: 100%; padding: 10px 10px; border-radius: 10px;
+      background:#0f1015; color:#e7e7ea; border:1px solid #242633;
+    }
+    .kpi { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Sampling Lab — Abtastung verstehen</h1>
+    <div class="grid">
+      <div class="card">
+        <div class="row">
+          <div class="pill kpi" id="nyqPill">Nyquist: –</div>
+          <div class="pill kpi" id="aliasPill">Aliasing: –</div>
+        </div>
+
+        <label>Signalform</label>
+        <select id="shape">
+          <option value="sine">Sinus</option>
+          <option value="square">Rechteck</option>
+          <option value="triangle">Dreieck</option>
+          <option value="mix">Mix (2 Sinusse)</option>
+        </select>
+
+        <label>Signalfrequenz f (Hz): <span class="kpi" id="fVal">2.0</span></label>
+        <input id="freq" type="range" min="0.5" max="20" step="0.1" value="2" />
+
+        <label>Abtastrate f<sub>s</sub> (Hz): <span class="kpi" id="fsVal">12</span></label>
+        <input id="fs" type="range" min="2" max="120" step="1" value="12" />
+
+        <label>Fenster (Sekunden): <span class="kpi" id="tVal">1.00</span></label>
+        <input id="window" type="range" min="0.5" max="3" step="0.05" value="1" />
+
+        <div class="row" style="margin-top:12px;">
+          <button id="toggleRecon">Rekonstruktion: AN</button>
+          <button id="toggleHold">Sample-&-Hold: AUS</button>
+        </div>
+
+        <p class="tiny" style="margin-top:12px;">
+          <b>Merksatz:</b> Damit ein Sinus mit Frequenz <i>f</i> eindeutig abgetastet werden kann, gilt
+          <b>f<sub>s</sub> ≥ 2·f</b> (Nyquist). Wenn nicht, entsteht <b>Aliasing</b> (die Kurve “wirkt” wie eine andere Frequenz).
+        </p>
+      </div>
+
+      <div>
+        <canvas id="c"></canvas>
+        <div class="row" style="margin-top:10px;">
+          <div class="pill">Linie: Original (kontinuierlich)</div>
+          <div class="pill">Punkte: Samples</div>
+          <div class="pill">Linie: Rekonstruktion (ideal, sinc) / optional Hold</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  const el = {
+    shape: document.getElementById('shape'),
+    freq: document.getElementById('freq'),
+    fs: document.getElementById('fs'),
+    window: document.getElementById('window'),
+    fVal: document.getElementById('fVal'),
+    fsVal: document.getElementById('fsVal'),
+    tVal: document.getElementById('tVal'),
+    nyqPill: document.getElementById('nyqPill'),
+    aliasPill: document.getElementById('aliasPill'),
+    toggleRecon: document.getElementById('toggleRecon'),
+    toggleHold: document.getElementById('toggleHold'),
+  };
+
+  let showRecon = true;
+  let showHold = false;
+
+  function resize() {
+    const dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.floor(rect.width * dpr);
+    canvas.height = Math.floor(rect.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw();
+  }
+  window.addEventListener('resize', resize);
+
+  function clamp(x, a, b){ return Math.max(a, Math.min(b, x)); }
+
+  function signal(t, f, shape) {
+    const w = 2 * Math.PI * f;
+    if (shape === 'sine') return Math.sin(w * t);
+    if (shape === 'square') return Math.sign(Math.sin(w * t)) || 1;
+    if (shape === 'triangle') {
+      // Dreieck über saw -> abs
+      const p = (t * f) % 1; // [0,1)
+      return 1 - 4 * Math.abs(p - 0.5); // [-1,1]
+    }
+    if (shape === 'mix') {
+      return 0.65 * Math.sin(w * t) + 0.35 * Math.sin(2 * w * t + 0.6);
+    }
+    return Math.sin(w * t);
+  }
+
+  // sinc(x) = sin(pi x) / (pi x)
+  function sinc(x){
+    if (Math.abs(x) < 1e-8) return 1;
+    const pix = Math.PI * x;
+    return Math.sin(pix) / pix;
+  }
+
+  function computeSamples(f, fs, T, shape){
+    const dt = 1 / fs;
+    const n = Math.floor(T / dt) + 1;
+    const xs = [];
+    const ys = [];
+    for (let i=0;i<n;i++){
+      const t = i * dt;
+      xs.push(t);
+      ys.push(signal(t, f, shape));
+    }
+    return {xs, ys, dt};
+  }
+
+  function reconAt(t, samples, fs){
+    // ideal bandlimited interpolation: sum x[n] * sinc(fs*(t - n/fs))
+    const {xs, ys} = samples;
+    let s = 0;
+    for (let i=0;i<xs.length;i++){
+      s += ys[i] * sinc(fs * (t - xs[i]));
+    }
+    return s;
+  }
+
+  function holdAt(t, samples){
+    const {xs, ys, dt} = samples;
+    if (t <= xs[0]) return ys[0];
+    const i = Math.floor(t / dt);
+    const idx = clamp(i, 0, ys.length - 1);
+    return ys[idx];
+  }
+
+  function drawAxes(w, h, pad){
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 1;
+
+    // horizontal midline y=0
+    const y0 = pad + (h - 2*pad)/2;
+    ctx.beginPath();
+    ctx.moveTo(pad, y0);
+    ctx.lineTo(w - pad, y0);
+    ctx.stroke();
+
+    // vertical grid
+    const gx = 10;
+    for (let i=0;i<=gx;i++){
+      const x = pad + (w - 2*pad) * i / gx;
+      ctx.beginPath();
+      ctx.moveTo(x, pad);
+      ctx.lineTo(x, h - pad);
+      ctx.stroke();
+    }
+
+    // horizontal grid
+    const gy = 8;
+    for (let j=0;j<=gy;j++){
+      const y = pad + (h - 2*pad) * j / gy;
+      ctx.beginPath();
+      ctx.moveTo(pad, y);
+      ctx.lineTo(w - pad, y);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function drawCurve(getY, T, w, h, pad, lineWidth, alpha){
+    ctx.save();
+    ctx.strokeStyle = `rgba(231,231,234,${alpha})`; // light
+    ctx.lineWidth = lineWidth;
+    ctx.beginPath();
+    const N = Math.max(400, Math.floor(w)); // smooth
+    for (let i=0;i<=N;i++){
+      const t = T * i / N;
+      const y = getY(t);
+      const xPix = pad + (w - 2*pad) * (t / T);
+      const yPix = pad + (h - 2*pad) * (0.5 - 0.45 * y);
+      if (i===0) ctx.moveTo(xPix, yPix);
+      else ctx.lineTo(xPix, yPix);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawSamples(samples, T, w, h, pad){
+    ctx.save();
+    ctx.fillStyle = 'rgba(126,200,255,0.95)';
+    ctx.strokeStyle = 'rgba(126,200,255,0.35)';
+    ctx.lineWidth = 1;
+
+    for (let i=0;i<samples.xs.length;i++){
+      const t = samples.xs[i];
+      const y = samples.ys[i];
+      const xPix = pad + (w - 2*pad) * (t / T);
+      const yPix = pad + (h - 2*pad) * (0.5 - 0.45 * y);
+
+      // stem
+      const y0 = pad + (h - 2*pad)/2;
+      ctx.beginPath();
+      ctx.moveTo(xPix, y0);
+      ctx.lineTo(xPix, yPix);
+      ctx.stroke();
+
+      // point
+      ctx.beginPath();
+      ctx.arc(xPix, yPix, 3.5, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function aliasFrequency(f, fs){
+    // Alias in baseband: fold into [0, fs/2]
+    // f_alias = |f - k*fs| minimized
+    const k = Math.round(f / fs);
+    const fa = Math.abs(f - k * fs);
+    const folded = fa > fs/2 ? fs - fa : fa;
+    return folded;
+  }
+
+  function draw(){
+    const w = canvas.getBoundingClientRect().width;
+    const h = canvas.getBoundingClientRect().height;
+
+    ctx.clearRect(0,0,w,h);
+
+    const f = parseFloat(el.freq.value);
+    const fs = parseFloat(el.fs.value);
+    const T = parseFloat(el.window.value);
+    const shape = el.shape.value;
+
+    el.fVal.textContent = f.toFixed(1);
+    el.fsVal.textContent = fs.toFixed(0);
+    el.tVal.textContent = T.toFixed(2);
+
+    // Nyquist check (für "reinen" Sinus gut interpretierbar)
+    const nyq = fs / 2;
+    const aliasing = f > nyq + 1e-9;
+
+    el.nyqPill.textContent = `Nyquist fₛ/2 = ${nyq.toFixed(1)} Hz`;
+    const fa = aliasFrequency(f, fs);
+    el.aliasPill.textContent = aliasing
+      ? `Aliasing: JA (wirkt wie ~${fa.toFixed(2)} Hz)`
+      : `Aliasing: NEIN`;
+
+    el.aliasPill.classList.toggle('warn', aliasing);
+
+    const pad = 28;
+    drawAxes(w,h,pad);
+
+    // Samples
+    const samples = computeSamples(f, fs, T, shape);
+
+    // Original curve
+    drawCurve((t)=>signal(t,f,shape), T, w, h, pad, 2.2, 0.85);
+
+    // Reconstruction
+    if (showRecon) {
+      if (showHold) {
+        // Hold curve
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,190,120,0.9)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        const N = Math.max(400, Math.floor(w));
+        for (let i=0;i<=N;i++){
+          const t = T * i / N;
+          const y = holdAt(t, samples);
+          const xPix = pad + (w - 2*pad) * (t / T);
+          const yPix = pad + (h - 2*pad) * (0.5 - 0.45 * y);
+          if (i===0) ctx.moveTo(xPix, yPix);
+          else ctx.lineTo(xPix, yPix);
+        }
+        ctx.stroke();
+        ctx.restore();
+      } else {
+        // Ideal sinc recon (good for showing Nyquist/aliasing)
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,190,120,0.9)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        const N = Math.max(500, Math.floor(w));
+        for (let i=0;i<=N;i++){
+          const t = T * i / N;
+          const y = reconAt(t, samples, fs);
+          const xPix = pad + (w - 2*pad) * (t / T);
+          const yPix = pad + (h - 2*pad) * (0.5 - 0.45 * y);
+          if (i===0) ctx.moveTo(xPix, yPix);
+          else ctx.lineTo(xPix, yPix);
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    drawSamples(samples, T, w, h, pad);
+  }
+
+  // events
+  [el.shape, el.freq, el.fs, el.window].forEach(x => x.addEventListener('input', draw));
+
+  el.toggleRecon.addEventListener('click', () => {
+    showRecon = !showRecon;
+    el.toggleRecon.textContent = `Rekonstruktion: ${showRecon ? 'AN' : 'AUS'}`;
+    draw();
+  });
+
+  el.toggleHold.addEventListener('click', () => {
+    showHold = !showHold;
+    el.toggleHold.textContent = `Sample-&-Hold: ${showHold ? 'AN' : 'AUS'}`;
+    draw();
+  });
+
+  resize();
+})();
+</script>
+</body>
+</html>
